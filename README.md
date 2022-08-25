@@ -1,120 +1,110 @@
-# vue-loader [![Build Status](https://circleci.com/gh/vuejs/vue-loader/tree/master.svg?style=shield)](https://circleci.com/gh/vuejs/vue-loader/tree/master) [![Windows Build status](https://ci.appveyor.com/api/projects/status/8cdonrkbg6m4k1tm/branch/master?svg=true)](https://ci.appveyor.com/project/yyx990803/vue-loader/branch/master)
+# vue-loader-matchresource
+# 功能
+修改了vue-loader的rules匹配策略,用webpack4 matchResource功能替代克隆Rules实现.
 
-> webpack loader for Vue Single-File Components
+带来的是更直观的rules匹配策略,减少了webpack编译.vue文件生成的module数量.
 
-**NOTE:** The master branch now hosts the code for v15! Legacy code is now in the [v14 branch](https://github.com/vuejs/vue-loader/tree/v14).
+出自于 [webpack PR 7462](https://github.com/webpack/webpack/pull/7462)
 
-- [Documentation](https://vue-loader.vuejs.org)
-- [Migrating from v14](https://vue-loader.vuejs.org/migrating.html)
+来两张流程图来看一下出入点:
 
-## What is Vue Loader?
+## before
+![image](./public/img.png)
 
-`vue-loader` is a loader for [webpack](https://webpack.js.org/) that allows you to author Vue components in a format called [Single-File Components (SFCs)](./docs/spec.md):
+## after
+![image](./public/img_1.png)
 
-``` vue
-<template>
-  <div class="example">{{ msg }}</div>
-</template>
 
-<script>
-export default {
-  data () {
-    return {
-      msg: 'Hello world!'
-    }
-  }
-}
-</script>
 
-<style>
-.example {
-  color: red;
-}
-</style>
+# 具体实现
+## 思路
+1. 修改vue-loader处理后request为`!=!`语法,以便交给webpack去匹配对应rules
+2. 修改vueLoaderPlugin中rules调度,以便matchResource匹配对应rules
+
+## vue-loader
+如`./a.vue?query...`,
+
+* template处理为`a.lang!=!vue-loader!request...`lang为对应模板引擎后缀,如无就是空
+* script同上,不过默认是.js
+* style同上,默认.css
+
+```javascript
+//template
+const fileName = src.match (/(\w+)\.vue/)[1]
+const matchResource = `${fileName}${descriptor.template.attrs.lang ? '.' + descriptor.template.attrs.lang : ''}?type=template!=!vue-loader!`
+const request = templateRequest = stringifyRequest (matchResource + src + query)
+//script
+const matchResource = `${fileName}.${descriptor.script.attrs.lang || 'js'}!=!vue-loader!`
+//style
+const matchResource = `${fileName}.${style.attrs.lang || 'css'}?type=style!=!vue-loader!`
 ```
+## VueLoaderPlugin
+1. 在template block中, 处理顺序为vue-loader->(模板引擎)-loader->templateLoader,因为最后要由templateLoader生成render函数.
+2. 在style block中,处理顺序为vue-loader->预处理器-loader->stylePostLoader->css-loader->style-loader,故stylePostLoader应该一直确保在css-loader之前.
+3. 在script block中,直接交给webpack处理js规则就可.
 
-There are many cool features provided by `vue-loader`:
+```javascript
+        const templateLoaderRule = {
+            loader: templateLoaderPath,
+            resourceQuery: query => {
+                const parsed = qs.parse (query.slice (1))
+                return parsed.type === "template"
+            }
+        }
+        const stylePostLoaderRule = {
+            loader: stylePostLoaderPath,
+            resourceQuery: query => {
+                const parsed = qs.parse (query.slice (1))
+                return parsed.type === "style"
+            }
+        }
+        for (let rule of rules) {
+            let loaders = rule.use
+            for (let i in loaders) {
+                if (loaders[i].loader === 'css-loader') {
+                    loaders.splice (++i, 0, stylePostLoaderRule)
+                }
+            }
+        }
+        // replace original rules
+        compiler.options.module.rules = [
+            templateLoaderRule,
+            ...rules
+        ]
+```
+可以看到就是把pitcher中干的事在这里做了,确保templateLoader执行顺序在webapck rules之后,确保stylePostLoader执行在webapck rules中的css-loader之前.
 
-- Allows using other webpack loaders for each part of a Vue component, for example Sass for `<style>` and Pug for `<template>`;
-- Allows custom blocks in a `.vue` file that can have custom loader chains applied to them;
-- Treat static assets referenced in `<style>` and `<template>` as module dependencies and handle them with webpack loaders;
-- Simulate scoped CSS for each component;
-- State-preserving hot-reloading during development.
+# 优化
+* 减少了module生成,webpack的整体流程是建立在对module对象的操作上,故module减少会优化webpack依赖构建和chunk graph生成
+* 减少了rules,webpack的resolve流程确定loader是和rules中条目一一对比的,显然会减少对比次数.
 
-In a nutshell, the combination of webpack and `vue-loader` gives you a modern, flexible and extremely powerful front-end workflow for authoring Vue.js applications.
+在ruoyi前端框架下测试数据:
 
-## How It Works
-
-> The following section is for maintainers and contributors who are interested in the internal implementation details of `vue-loader`, and is **not** required knowledge for end users.
-
-`vue-loader` is not a simple source transform loader. It handles each language blocks inside an SFC with its own dedicated loader chain (you can think of each block as a "virtual module"), and finally assembles the blocks together into the final module. Here's a brief overview of how the whole thing works:
-
-1. `vue-loader` parses the SFC source code into an *SFC Descriptor* using `@vue/component-compiler-utils`. It then generates an import for each language block so the actual returned module code looks like this:
-
-    ``` js
-    // code returned from the main loader for 'source.vue'
-
-    // import the <template> block
-    import render from 'source.vue?vue&type=template'
-    // import the <script> block
-    import script from 'source.vue?vue&type=script'
-    export * from 'source.vue?vue&type=script'
-    // import <style> blocks
-    import 'source.vue?vue&type=style&index=1'
-
-    script.render = render
-    export default script
-    ```
-
-    Notice how the code is importing `source.vue` itself, but with different request queries for each block.
-
-2. We want the content in `script` block to be treated like `.js` files (and if it's `<script lang="ts">`, we want to to be treated like `.ts` files). Same for other language blocks. So we want webpack to apply any configured module rules that matches `.js` also to requests that look like `source.vue?vue&type=script`. This is what `VueLoaderPlugin` (`src/plugins.ts`) does: for each module rule in the webpack config, it creates a modified clone that targets corresponding Vue language block requests.
-
-    Suppose we have configured `babel-loader` for all `*.js` files. That rule will be cloned and applied to Vue SFC `<script>` blocks as well. Internally to webpack, a request like
-
-    ``` js
-    import script from 'source.vue?vue&type=script'
-    ```
-
-    Will expand to:
-
-    ``` js
-    import script from 'babel-loader!vue-loader!source.vue?vue&type=script'
-    ```
-
-    Notice the `vue-loader` is also matched because `vue-loader` are applied to `.vue` files.
-
-    Similarly, if you have configured `style-loader` + `css-loader` + `sass-loader` for `*.scss` files:
-
-    ``` html
-    <style scoped lang="scss">
-    ```
-
-    Will be returned by `vue-loader` as:
-
-    ``` js
-    import 'source.vue?vue&type=style&index=1&scoped&lang=scss'
-    ```
-
-    And webpack will expand it to:
-
-    ``` js
-    import 'style-loader!css-loader!sass-loader!vue-loader!source.vue?vue&type=style&index=1&scoped&lang=scss'
-    ```
-
-3. When processing the expanded requests, the main `vue-loader` will get invoked again. This time though, the loader notices that the request has queries and is targeting a specific block only. So it selects (`src/select.ts`) the inner content of the target block and passes it on to the loaders matched after it.
-
-4. For the `<script>` block, this is pretty much it. For `<template>` and `<style>` blocks though, a few extra tasks need to be performed:
-
-    - We need to compile the template using the Vue template compiler;
-    - We need to post-process the CSS in `<style scoped>` blocks, **before** `css-loader`.
-
-    Technically, these are additional loaders (`src/templateLoader.ts` and `src/stylePostLoader.ts`) that need to be injected into the expanded loader chain. It would be very complicated if the end users have to configure this themselves, so `VueLoaderPlugin` also injects a global [Pitching Loader](https://webpack.js.org/api/loaders/#pitching-loader) (`src/pitcher.ts`) that intercepts Vue `<template>` and `<style>` requests and injects the necessary loaders. The final requests look like the following:
-
-    ``` js
-    // <template lang="pug">
-    import 'vue-loader/template-loader!pug-loader!vue-loader!source.vue?vue&type=template'
-
-    // <style scoped lang="scss">
-    import 'style-loader!css-loader!vue-loader/style-post-loader!sass-loader!vue-loader!source.vue?vue&type=style&index=1&scoped&lang=scss'
-    ```
+```json
+//origin vue-loader
+{
+  "time": 38325,
+  "moduleNums": 1734,
+  "chunkNums": 13,
+  "vueFileNums": 84,
+  "vueStyleRequestNums": 66,
+  "vueStylePitcherReqNums": 33,
+  "vueTemplateRequestNums": 81,
+  "vueTemplatePitcherReqNums": 81,
+  "vueScriptRequestNums": 83,
+  "vueScriptPitcherReqNums": 83
+}
+// matchResource  vue-loader 
+{
+  "time": 36903,
+  "moduleNums": 1537,
+  "chunkNums": 13,
+  "vueFileNums": 84,
+  "vueStyleRequestNums": 66,//实际style block数量33 因为css-loader会额外生成一次request
+  "vueStylePitcherReqNums": 0,
+  "vueTemplateRequestNums": 81,
+  "vueTemplatePitcherReqNums": 0,
+  "vueScriptRequestNums": 83,
+  "vueScriptPitcherReqNums": 0
+}
+```
